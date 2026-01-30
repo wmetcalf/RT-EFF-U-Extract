@@ -1,0 +1,8 @@
+oletools>=0.60
+pyre2
+regex
+
+# Optional: Shellcode emulation (uncomment to enable)
+# Requires Python 3.8+
+# Install with: pip install speakeasy-emulator
+# speakeasy-emulator>=1.5.0

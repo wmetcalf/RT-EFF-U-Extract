@@ -1,0 +1,5 @@
+include README.md
+include LICENSE
+include requirements.txt
+include rt-eff-u-extract.png
+recursive-include rtf_eff_u_extract *.json
