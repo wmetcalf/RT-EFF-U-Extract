@@ -70,18 +70,7 @@ rtf-eff-u-extract --emulate --timeout 30 suspicious.rtf
    - Standard ASCII URLs (`http://`, `https://`, `ftp://`)
    - Wide/UTF-16LE encoded URLs
    - Null-byte separated URLs
-5. **CLSID Identification**: Maps object CLSIDs to known ActiveX controls
-
-## Known CLSIDs
-
-The tool identifies these dangerous/interesting CLSIDs:
-
-| CLSID | Description |
-|-------|-------------|
-| `0002CE02-0000-0000-C000-000000000046` | Microsoft Equation Editor 3.0 (CVE-2017-11882) |
-| `F20DA720-C02F-11CE-927B-0800095AE340` | Package/Packager Object |
-| `00000300-0000-0000-C000-000000000046` | StdOleLink (OLE Link) |
-| `00020821-0000-0000-C000-000000000046` | Microsoft Excel Worksheet |
+5. **CLSID Identification**: Maps object CLSIDs to known ActiveX controls (including dangerous controls like Equation Editor 3.0, Package objects, and Shell.Explorer.1)
 
 ## Output Format
 
