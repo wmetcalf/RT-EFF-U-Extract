@@ -1,4 +1,4 @@
-# RTF Eff-U Extract: A very dumb (and smart) url extracction util for the file format we all love to hate
+# RTF Eff-U Extract: A very dumb (and smart) url extraction util for the file format we all love to hate
 
 ![RTF Eff-U Extract](rt-eff-u-extract.png)
 
