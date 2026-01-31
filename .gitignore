@@ -46,3 +46,7 @@ Thumbs.db
 
 # Backup
 pybackup/
+
+# Local test samples
+samples/
+test/
