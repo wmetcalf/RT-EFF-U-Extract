@@ -1,8 +1,8 @@
-# RTF Eff-U Extract
+# RTF Eff-U Extract A parse for the file format I love to hate
 
 ![RTF Eff-U Extract](rt-eff-u-extract.png)
 
-A Python tool to extract URLs from RTF and DOC embedded objects using oletools/rtfobj with support for obfuscation detection, CLSID mapping, and optional shellcode emulation.
+A Python tool to extract URLs from RTF and DOC embedded objects using oletools/rtfobj with support for obfuscation detection, CLSID mapping, and optional shellcode emulation. Yep we used the vibes, and there is like 1000% rough edges
 
 ## Features
 
