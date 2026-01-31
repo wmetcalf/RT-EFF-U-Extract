@@ -1,4 +1,4 @@
-# RTF Eff-U Extract A parse for the file format I love to hate
+# RTF Eff-U Extract: A parser for the file format we all love to hate
 
 ![RTF Eff-U Extract](rt-eff-u-extract.png)
 
