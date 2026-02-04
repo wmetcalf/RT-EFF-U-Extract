@@ -306,6 +306,8 @@ class ShellExplorerLinkObject:
     urls: List[str]
     folders: List[str]
     items: List[Dict]
+    is_exploit: bool = True  # Shell.Explorer.1 IE shell links indicate CVE-2026-21509
+    exploit_reason: str = "Shell.Explorer.1 Internet Explorer Shell Link (CVE-2026-21509)"
 
     def get_urls(self) -> List[str]:
         """Extract all URLs from link"""
@@ -944,7 +946,9 @@ def parse_ole_object(clsid: str, data: bytes, emulate_shellcode: bool = False, t
                 'parsed': parsed,
                 'urls': parsed.get_urls(),
                 'folders': parsed.folders,
-                'items': parsed.items
+                'items': parsed.items,
+                'is_exploit': parsed.is_exploit,
+                'exploit_reason': parsed.exploit_reason
             }
 
     # Equation Editor 3.0 (all variants)

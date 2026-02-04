@@ -1102,6 +1102,9 @@ def _analyze_rtf_objects_impl(file_path: str, emulate: bool = False, timeout: in
 
                             elif parsed_obj['type'] == 'OLE2Link':
                                 obj_info['ole2link_url'] = parsed_obj.get('url')
+                            elif parsed_obj['type'] == 'ShellExplorer':
+                                obj_info['is_exploit'] = parsed_obj.get('is_exploit', False)
+                                obj_info['exploit_reason'] = parsed_obj.get('exploit_reason')
                             elif parsed_obj['type'] == 'EquationEditor':
                                 obj_info['equation_editor'] = True
                                 obj_info['shellcode_found'] = parsed_obj.get('font_record_found', False)
@@ -1257,7 +1260,7 @@ def _analyze_rtf_objects_impl(file_path: str, emulate: bool = False, timeout: in
                                          if is_eq:
                                               obj_info['is_exploit'] = True
                                               obj_info['exploit_reason'] = "Malformed Equation Editor Object (Likely CVE-2018-0802)"
-                                              print(f"[!] EXPLOIT DETECTED: {obj_info['exploit_reason']}", file=sys.stderr)
+                                              print(f"[!] POSSIBLE EXPLOIT DETECTED: {obj_info['exploit_reason']}", file=sys.stderr)
 
                     except Exception as e:
                         # print(f"Emulation error: {e}")
@@ -1361,7 +1364,7 @@ def print_results(results: List[Dict], verbose: bool = False):
         print(f"  Raw Data Size: {obj_info['raw_data_size']} bytes")
 
         if obj_info.get('is_exploit'):
-            print(f"  [!] EXPLOIT DETECTED: {obj_info.get('exploit_reason', 'Probable exploit payload')}")
+            print(f"  [!] POSSIBLE EXPLOIT DETECTED: {obj_info.get('exploit_reason', 'Probable exploit payload')}")
 
         if obj_info['urls']:
             print(f"  URLs Found: {len(obj_info['urls'])}")
