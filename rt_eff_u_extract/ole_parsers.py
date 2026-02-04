@@ -69,7 +69,9 @@ class EquationEditorObject:
     version: int
     platform: int
     product: int
-    font_record_found: bool
+    is_exploit: bool = False
+    exploit_reason: Optional[str] = None
+    font_record_found: bool = False
     shellcode: Optional[bytes] = None
     shellcode_offset: Optional[int] = None
     emulation_results: Optional[Dict] = None
@@ -682,46 +684,62 @@ class EquationEditorParser:
                         ('ole10native', True)
                     ]
 
-                    # Get all streams and search case-insensitively
+                    # Get all streams and search case-insensitively using loose matching
                     for entry in ole.listdir():
                         entry_name = '/'.join(entry) if isinstance(entry, list) else str(entry)
                         entry_lower = entry_name.lower()
+                        
+                        # Check against simplified keywords
+                        # If "native" or "equation" or "eq" is in the name, it's a candidate
+                        if 'native' in entry_lower or 'equation' in entry_lower or 'eq' in entry_lower:
+                             try:
+                                stream = ole.openstream(entry)
+                                stream_data = stream.read()
+                                
+                                # Heuristic: Check if this stream LOOKS like MTEF or OLE10Native
+                                # OLE10Native often has a 4-byte size at start
+                                # MTEF starts with 03 01 01
+                                
+                                # Case 1: Direct MTEF
+                                if b'\x03\x01\x01' in stream_data[:10]:
+                                     mtef_data = stream_data
+                                     break
+                                     
+                                # Case 2: OLE10Native wrapper (size + data)
+                                # The size is 4 bytes. If we skip 4 bytes, do we see MTEF?
+                                if len(stream_data) > 4 and b'\x03\x01\x01' in stream_data[4:20]:
+                                     mtef_data = stream_data[4:]
+                                     break
+                                     
+                                # Case 3: Just assume it's the right stream but unknown format, return it
+                                # This is the "trust the name" fallback
+                                # But let's prioritize finding the actual MTEF signature
+                                if not mtef_data:
+                                     # Store as potential candidate if we don't find a better one
+                                     # OLE10Native typically skips 4 bytes
+                                     if 'native' in entry_lower and len(stream_data) > 4:
+                                         mtef_data = stream_data[4:]
+                                     else:
+                                         mtef_data = stream_data
+                             except:
+                                continue
 
-                        for target_name, is_ole10native in target_streams:
-                            if entry_lower.endswith(target_name):
-                                try:
-                                    stream = ole.openstream(entry)
-                                    stream_data = stream.read()
 
-                                    # Check if this is OLE10NATIVE format (has 4-byte size header)
-                                    if is_ole10native:
-                                        # Skip first 4 bytes (size field) and extract payload
-                                        if len(stream_data) > 4:
-                                            mtef_data = stream_data[4:]
-                                        else:
-                                            mtef_data = stream_data
-                                    else:
-                                        mtef_data = stream_data
-                                    break
-                                except:
-                                    continue
 
-                        if mtef_data:
-                            break
 
                     # If no specific stream found, try to find MTEF header in any stream
                     if not mtef_data:
                         for entry in ole.listdir():
                             try:
                                 stream = ole.openstream(entry)
-                                stream_data = stream.read()
+                                data_chunk = stream.read()
                                 # Look for MTEF header (03 01 01) or record size header (1c 00)
-                                mtef_pos = stream_data.find(b'\x03\x01\x01')
+                                mtef_pos = data_chunk.find(b'\x03\x01\x01')
                                 if mtef_pos == -1:
-                                    mtef_pos = stream_data.find(b'\x1c\x00')
+                                    mtef_pos = data_chunk.find(b'\x1c\x00')
                                 
                                 if mtef_pos >= 0:
-                                    mtef_data = stream_data[mtef_pos:]
+                                    mtef_data = data_chunk[mtef_pos:]
                                     break
                             except:
                                 continue
@@ -767,12 +785,22 @@ class EquationEditorParser:
                     typeface = data[i+1]
                     style = data[i+2]
                     
-                    # Heuristic: Valid font records usually have low typeface/style values
-                    # and often have non-zero data in the font name area (i+3 onwards)
-                    if typeface <= 10 and style <= 32:
-                         # Check if this looks like a potential overflow (non-zero name)
-                         if any(b != 0 for b in data[i+3:i+43]):
-                             font_record_offsets.append(i)
+                    # Heuristic: Relaxed check for typeface and style
+                    # Malware often uses out-of-range values to evade simple parsers
+                    # Standard is typeface <= 10, style <= 32
+                    if typeface <= 128 and style <= 255:
+                        # Extract font name (null-terminated string after typeface/style)
+                        name_start = i + 3
+                        nul_pos = data.find(b'\x00', name_start)
+                        if nul_pos != -1:
+                            name_len = nul_pos - name_start
+                            # Standard MTEF font name length is typically < 32 bytes
+                            # CVE-2017-11882 exploits use names > 32 bytes to overflow a buffer
+                            if name_len >= 32:
+                                font_record_offsets.append(i)
+                        else:
+                            # No null terminator? Could also be an exploit or garbage
+                            font_record_offsets.append(i)
 
             if not font_record_offsets:
                 return EquationEditorObject(
@@ -804,7 +832,10 @@ class EquationEditorParser:
             emulation_results = None
             if emulate and HAS_EMULATOR and shellcode and len(shellcode) > 10:
                 try:
-                    from .shellcode_emulator import scan_shellcode
+                    try:
+                        from .shellcode_emulator import scan_shellcode
+                    except ImportError:
+                        from shellcode_emulator import scan_shellcode
                     # Use a focused scan on the candidates found
                     scan_res = scan_shellcode(data, arch='x86', timeout=timeout, limit=0, priority_offsets=candidates)
                     if scan_res.get('success'):
@@ -812,11 +843,28 @@ class EquationEditorParser:
                 except Exception as e:
                     emulation_results = {'success': False, 'error': str(e), 'urls': []}
 
+            # Determine if we should flag as an exploit
+            is_exploit = False
+            exploit_reason = None
+            if font_record_offsets:
+                # Check the first candidate's overflow
+                offset = font_record_offsets[0]
+                name_start = offset + 3
+                nul_pos = data.find(b'\x00', name_start)
+                if nul_pos == -1 or (nul_pos - name_start) >= 32:
+                    # Double check it's not JUST a few bytes of garbage
+                    length = (nul_pos - name_start) if nul_pos != -1 else len(data) - name_start
+                    if length >= 32:
+                        is_exploit = True
+                        exploit_reason = f"MTEF Font name overflow detected (length: {length})"
+
             return EquationEditorObject(
                 version=version,
                 platform=platform,
                 product=product,
-                font_record_found=True,
+                is_exploit=is_exploit,
+                exploit_reason=exploit_reason,
+                font_record_found=bool(font_record_offsets),
                 shellcode=shellcode,
                 shellcode_offset=primary_sc_offset,
                 emulation_results=emulation_results
@@ -873,8 +921,10 @@ def parse_ole_object(clsid: str, data: bytes, emulate_shellcode: bool = False, t
                 'embedded_size': len(parsed.embedded_data) if parsed.embedded_data else 0
             }
 
-    # StdOleLink / OLE2Link
-    elif clsid_upper == '00000300-0000-0000-C000-000000000046':
+    # StdOleLink / OLE2Link / File Moniker
+    elif clsid_upper in ['00000300-0000-0000-C000-000000000046', 
+                         '00000301-0000-0000-C000-000000000046',
+                         '00000303-0000-0000-C000-000000000046']:
         parsed = OLE2LinkParser.parse(data)
         if parsed:
             return {
@@ -909,6 +959,8 @@ def parse_ole_object(clsid: str, data: bytes, emulate_shellcode: bool = False, t
                 'shellcode': parsed.shellcode,
                 'shellcode_offset': parsed.shellcode_offset,
                 'font_record_found': parsed.font_record_found,
+                'is_exploit': parsed.is_exploit,
+                'exploit_reason': parsed.exploit_reason,
                 'urls': parsed.get_urls()  # URLs from emulation
             }
             if parsed.emulation_results:

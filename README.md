@@ -7,16 +7,22 @@ A Python tool to extract URLs from RTF and DOC embedded objects using oletools/r
 ## Features
 
 - **RTF Validation**: Checks for `{\rt` header to validate RTF files
+- **Document-Level URL Extraction**: Extracts URLs from `\template`, `\hyperlink`, `\includepicture`, `\htmltag` with full deobfuscation
 - **Structure-Based Parsing**: Parses known OLE object structures (Package, OLE2Link, Equation Editor)
-- **URL Extraction**: Supports both ASCII and wide/UTF-16 encoded URLs
+- **URL Extraction**: Supports both ASCII and wide/UTF-16 encoded URLs with intelligent cleanup
+  - Detects 2-byte length prefixes in UTF-16LE strings
+  - Removes trailing garbage padding from malware samples
+  - Handles double-null terminators correctly
 - **Deobfuscation**: Removes common obfuscations:
   - Whitespace injection (spaces, tabs, newlines)
   - RTF comments and control words
   - Null byte padding
   - Hex encoding tricks
+  - Split control words and unicode sequences
 - **CLSID Mapping**: Associates ActiveX controls with extracted URLs
 - **Known Exploit Detection**: Identifies dangerous controls (Equation Editor 3.0, etc.)
 - **Shellcode Emulation** (optional): Uses Speakeasy emulator to extract URLs from obfuscated shellcode
+- **Library API**: Importable Python module for integration into security scanning tools
 
 ## Installation
 
@@ -39,23 +45,130 @@ pip install speakeasy-emulator
 
 ### Basic usage:
 ```bash
-rtf-eff-u-extract malicious.rtf
+rt-eff-u-extract malicious.rtf
 ```
 
 ### Verbose output with offsets:
 ```bash
-rtf-eff-u-extract -v suspicious.rtf
+rt-eff-u-extract -v suspicious.rtf
 ```
 
 ### Export to JSON:
 ```bash
-rtf-eff-u-extract --json results.json document.rtf
+rt-eff-u-extract --json results.json document.rtf
 ```
 
 ### With shellcode emulation (requires speakeasy-emulator):
 ```bash
-rtf-eff-u-extract --emulate malicious.doc
-rtf-eff-u-extract --emulate --timeout 30 suspicious.rtf
+rt-eff-u-extract --emulate malicious.doc
+rt-eff-u-extract --emulate --timeout 30 suspicious.rtf
+```
+
+## Using as a Library
+
+The tool can be imported and used as a Python library for integration into other projects:
+
+### Basic Usage
+
+```python
+from rt_eff_u_extract import analyze_rtf_objects
+import json
+
+# Analyze RTF file (equivalent to CLI with --emulate)
+results = analyze_rtf_objects(
+    file_path="malicious.rtf",
+    emulate=True,   # Enable shellcode emulation (requires speakeasy-emulator)
+    timeout=10,     # Emulation timeout in seconds
+    dump=False      # Set True to dump object bodies to disk
+)
+
+# Process results
+for obj in results:
+    if obj['index'] == -1:
+        print(f"Document-level URLs (\\template, \\field, etc.):")
+    else:
+        print(f"Object #{obj['index']} ({obj['class_name']}):")
+
+    for url_info in obj['urls']:
+        print(f"  [{url_info['type']}] {url_info['url']}")
+
+    # Check for exploits
+    if obj.get('is_exploit'):
+        print(f"  EXPLOIT DETECTED: {obj['exploit_reason']}")
+
+# Export to JSON (equivalent to --json flag)
+with open('output.json', 'w') as f:
+    json.dump(results, f, indent=2)
+```
+
+### Return Format
+
+`analyze_rtf_objects()` returns a list of dictionaries. The first entry (index=-1) contains **document-level URLs** extracted from `\template`, `\hyperlink`, `\includepicture`, etc. Subsequent entries are **embedded OLE objects**:
+
+```python
+[
+    # Document-level URLs (index = -1)
+    {
+        'index': -1,
+        'class_name': 'Document Body',
+        'clsid': None,
+        'clsid_desc': 'Deobfuscated Document Content',
+        'raw_data_size': 2683823,
+        'urls': [
+            {
+                'type': 'doc-hyperlink',
+                'url': 'mailto:user@example.com',
+                'offset': 'obfuscated'
+            }
+        ],
+        'is_ole': False,
+        'is_package': False
+    },
+    # Embedded object URLs (index = 0, 1, 2, ...)
+    {
+        'index': 0,
+        'class_name': 'Equation.3',
+        'clsid': '0002CE02-0000-0000-C000-000000000046',
+        'clsid_desc': 'Microsoft Equation Editor 3.0 (CVE-2017-11882)',
+        'raw_data_size': 58088,
+        'urls': [
+            {
+                'url': 'http://192.168.217.250/payload.exe',
+                'type': 'wide-double-null',
+                'offset': '0x49fd'
+            }
+        ],
+        'is_exploit': True,
+        'exploit_reason': 'MTEF Font name overflow detected',
+        'shellcode_size': 1024,
+        'api_trace': 'URLDownloadToFileA("http://...")\nWinExec("payload.exe")'
+    }
+]
+```
+
+### Additional Utility Functions
+
+```python
+from rt_eff_u_extract import (
+    is_rtf_file,              # Check if file is RTF
+    extract_urls_from_data,   # Extract URLs from binary data
+    deobfuscate_hex,          # Clean obfuscated hex data
+    parse_ole_object          # Parse specific OLE structures
+)
+
+# Validate RTF file
+if is_rtf_file("suspicious.doc"):
+    print("Valid RTF file")
+
+# Extract URLs from raw binary data
+raw_data = b'http://example.com\x00...'
+urls = extract_urls_from_data(raw_data)
+for url_info in urls:
+    print(f"{url_info['type']}: {url_info['url']}")
+
+# Deobfuscate RTF hex data
+hex_data = b'68\\par74\\tab74\\par70...'
+clean_hex = deobfuscate_hex(hex_data)
 ```
 
 ## How It Works
@@ -98,7 +211,7 @@ Total URLs: 2
 
 ### Example 1: Shell.Explorer.1 with embedded URL (structure-based extraction)
 ```bash
-$ rtf-eff-u-extract Registration_Form.rtf
+$ rt-eff-u-extract Registration_Form.rtf
 ```
 
 ```
@@ -124,7 +237,7 @@ Total URLs: 1
 
 ### Example 2: Equation Editor shellcode (emulation required)
 ```bash
-$ rtf-eff-u-extract --emulate w.doc
+$ rt-eff-u-extract --emulate w.doc
 ```
 
 ```
@@ -150,7 +263,7 @@ Total URLs: 1
 
 ### Example 3: CVE-2017-11882 (Equation Editor exploit)
 ```bash
-$ rtf-eff-u-extract samples/cve-2017-11882.rtf
+$ rt-eff-u-extract samples/cve-2017-11882.rtf
 ```
 
 ```

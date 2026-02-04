@@ -33,6 +33,7 @@ References:
 import sys
 import argparse
 import json
+import hashlib
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 from oletools import rtfobj
@@ -103,42 +104,18 @@ def is_valid_url(url: str) -> bool:
     if not has_protocol:
         return False
 
-    # For very long URLs (>500 chars), check if they're just garbage
-    # by looking at character distribution
-    if len(url) > 500:
-        # Count printable ASCII vs total
-        printable_count = sum(1 for c in url if 32 <= ord(c) <= 126)
-        printable_ratio = printable_count / len(url)
+    # High entropy/garbage check
+    printable_chars = [c for c in url if 32 <= ord(c) <= 126]
+    if len(url) > 20 and len(printable_chars) / len(url) < 0.7:
+        return False
 
-        # If less than 80% printable, likely garbage
-        if printable_ratio < 0.8:
+    # Basic structure check for common protocols
+    if url.lower().startswith(('http://', 'https://')):
+        if '.' not in url or len(url) < 12:
             return False
-
-        # Check for excessive path depth (likely base64 blob masquerading as path)
-        if url.count('/') > 50 or url.count('\\') > 50:
-            return False
-
-        # Check entropy - if it's too uniform, it's likely garbage
-        # Simple check: count unique chars vs length
-        unique_chars = len(set(url.lower()))
-        # Base64 has 64 chars, normal URLs have more variation
-        if len(url) > 500 and unique_chars < 20:  # Too uniform
-            return False
-
-    # URL must have some structure beyond just slashes
-    # Filter out things like "///AAAAAAAAAAAAAA..."
-    url_no_protocol = url.split('://', 1)[-1] if '://' in url else url.lstrip('/\\')
-    if len(url_no_protocol) > 100:
-        # Check if it's just a repeating pattern or high-entropy garbage
-        # Look for domain or path structure
-        has_structure = any(c in url_no_protocol for c in ['.', ':', '?', '&', '='])
-        if not has_structure:
-            # No query params, no dots, no structure - likely garbage
-            # Unless it's a simple path
-            if len(url_no_protocol) > 200:
-                return False
 
     return True
+
 
 
 def deduplicate_urls(urls: List[Dict]) -> List[Dict]:
@@ -276,6 +253,200 @@ def is_rtf_file(file_path: str) -> bool:
         return False
 
 
+
+def deobfuscate_rtf_text(data: bytes) -> bytes:
+    """
+    Deobfuscate RTF text to reveal hidden strings/commands.
+    - Removes comments/ignorables
+    - Removes newlines
+    - Decodes \\'xx sequences
+    Returns: BYTES
+    """
+    # Ensure data is bytes
+    if not isinstance(data, bytes):
+        return data
+
+    text = data
+    
+    # 1. Remove comments/ignorables {\* ... }
+    # IGNORE known document-level tags to preserve them for scanning
+    # Remove groups that do NOT start with \template, \htmltag, \fldinst
+    text = re.sub(rb'\{\\[*](?!\\template|\\htmltag|\\fldinst)[^{}]+\}', b'', text)
+
+    # 1.5. Protect delimiters for key control words
+    # If \template is followed by newline/tab/null, stripping them merges tokens.
+    # We strip junk globally, so we must insert a SAFE delimiter (Space) if one is missing.
+    # Regex: (keyword) followed by non-alpha-non-space (which implies junk chars or punctuation)
+    # Actually simpler: Replace (keyword)[junk]+ with "(keyword) ".
+    # List: \template, \field, \htmltag, \fldinst
+    # Pattern: \\(template|field|htmltag|fldinst)(?=[\r\n\t\x00])
+    text = re.sub(rb'\\(template|field|htmltag|fldinst)(?=[\r\n\t\x00])', rb'\\\1 ', text)
+    
+    # 2. Remove ignorables like \*\destination
+    # Same exclusion apply if relevant, but typically only Step 1 catches split keywords
+    # text = re.sub(rb'\\[*]\\[a-z0-9]+\s*', b'', text)
+
+    # 3. Remove newlines/returns/tabs/nulls (RTF ignores them)
+    text = re.sub(rb'[\r\n\t\x00]+', b'', text)
+
+    # 3.5. Decode Unicode sequences (\uN and \ucN) and handle junk logic
+    
+    # Process \uN and \ucN manually to handle skip count state
+    output = bytearray()
+    i = 0
+    n = len(text)
+    skip_count = 1 # Default \uc1
+    
+    while i < n:
+        if text[i] == 92: # Backslash '\'
+            # Check for \ucN
+            match_uc = re.match(rb'\\uc(\d+)', text[i:i+10]) 
+            if match_uc:
+                try:
+                    skip_count = int(match_uc.group(1))
+                except:
+                    pass
+                i += len(match_uc.group(0))
+                continue
+                
+            # Check for \uN
+            match_u = re.match(rb'\\u(-?\d+)', text[i:i+10])
+            if match_u:
+                val_str = match_u.group(1)
+                val = int(val_str)
+                if val < 0: val += 65536
+                if 0 <= val <= 255:
+                    output.append(val)
+                else:
+                    output.append(ord('?'))
+                i += len(match_u.group(0))
+                skipped = 0
+                while skipped < skip_count and i < n:
+                    if text[i] == ord(' '): 
+                         i += 1 
+                         continue
+                    i += 1
+                    skipped += 1
+                continue
+                
+            # Check for ignorable control words (junk spaces)
+            match_ign = re.match(rb'\\(par|pard|tab|line|plain)(?![a-z0-9])', text[i:i+20])
+            if match_ign:
+                 i += len(match_ign.group(0))
+                 if i < n and text[i] == ord(' '):
+                     i += 1
+                 continue
+
+            # Check for escaped specials: \{ \} \\
+            if i+1 < n:
+                next_b = text[i+1]
+                if next_b in b'{}\\':
+                    output.append(next_b)
+                    i += 2
+                    continue
+                
+        output.append(text[i])
+        i += 1
+        
+    text = bytes(output)
+
+    # 4. Decode \'xx hex sequences manually ...
+    # re.sub with callback truncates large files with specific patterns?
+    output = bytearray()
+    last_pos = 0
+    pattern = re.compile(rb"\\'[0-9a-fA-F]{2}")
+    
+    for match in pattern.finditer(text):
+        output.extend(text[last_pos:match.start()])
+        try:
+            val = int(match.group(0)[2:], 16)
+            output.append(val)
+        except:
+            output.extend(match.group(0))
+        last_pos = match.end()
+    
+    output.extend(text[last_pos:])
+    text = bytes(output)
+    
+    # 5. Simplistic cleanup of braces used for grouping within keywords
+    # This is risky but helps with split keywords like \t}em{plate
+    # For now, let's just trust step 1 handled the major obfuscations
+    
+    return text
+
+
+def scan_document_body(data: bytes) -> List[Dict]:
+    """
+    Scan the entire document body for obfuscated external links.
+    Focuses on:
+    - \\template
+    - \\field (HYPERLINK)
+    - \\htmltag (detected as requested)
+    """
+    results = []
+    
+    # Deobfuscate the whole body
+    clean_text = deobfuscate_rtf_text(data)
+    # Deobfuscate the whole body
+    clean_text = deobfuscate_rtf_text(data)
+    
+    # helper to safely decode bytes to str for results
+    def safe_decode(b: bytes) -> str:
+        return b.decode('latin-1', errors='ignore')
+
+    # 1. Scan for \template targets
+    # Syntax: {\*\template URL} or \template URL
+    # Regex: Handle quoted and unquoted
+    template_matches = re.finditer(rb'\\template\s+(?:\"([^\"]+)\"|([^\s\}]+))', clean_text, re.IGNORECASE)
+    for m in template_matches:
+        url_bytes = m.group(1) or m.group(2)
+        url = safe_decode(url_bytes)
+        # Verify it looks like a URL/Path
+        if len(url) > 3 and (':' in url or url.startswith('\\\\') or '.' in url):
+            results.append({
+                'type': 'doc-template',
+                'url': url,
+                'offset': 'obfuscated' # We lost true offset during cleanup
+            })
+
+    # 2. Scan for HYPERLINK and INCLUDEPICTURE fields
+    # Syntax: \field{\*\fldinst { HYPERLINK "URL" }}
+    # Syntax: \field{\*\fldinst { INCLUDEPICTURE "URL" }}
+    # Regex: (HYPERLINK|INCLUDEPICTURE|INCLUDETEXT)\s+(?:\"([^\"]+)\"|([^\s\}]+))
+    hyperlinks = re.finditer(rb'(HYPERLINK|INCLUDEPICTURE|INCLUDETEXT)\s+(?:\"([^\"]+)\"|([^\s\}]+))', clean_text, re.IGNORECASE)
+    for m in hyperlinks:
+        keyword = safe_decode(m.group(1)).upper()
+        url_bytes = m.group(2) or m.group(3)
+        
+        # Determine type based on keyword
+        doc_type = 'doc-hyperlink'
+        if 'INCLUDEPICTURE' in keyword:
+            doc_type = 'doc-includepicture'
+        elif 'INCLUDETEXT' in keyword:
+            doc_type = 'doc-includetext'
+            
+        if url_bytes:
+             results.append({
+                'type': doc_type,
+                'url': safe_decode(url_bytes),
+                'offset': 'obfuscated'
+            })
+
+    # 3. Scan for \htmltag
+    # Syntax: {\*\htmltag ... href="URL" ...}
+    htmltags = re.finditer(rb'\\htmltag.*?(?:href|src)=[\'\"]?([^\s\'\"\}]+)', clean_text, re.IGNORECASE)
+    for m in htmltags:
+        url_bytes = m.group(1)
+        if url_bytes:
+             results.append({
+                'type': 'doc-htmltag',
+                'url': safe_decode(url_bytes),
+                'offset': 'obfuscated'
+            })
+            
+    return results
+
+
 def deobfuscate_hex(hex_data: bytes) -> bytes:
     r"""
     Remove common obfuscations from hex-encoded data based on RTF parser behavior.
@@ -367,14 +538,16 @@ def extract_urls_from_data(data: bytes) -> List[Dict[str, str]]:
     # Standard: \\server\share
     # Triple slash: ///server/share
     # Mixed slashes: //\server\share or \\/server/share
-    unc_pattern = rb'(?:[\\/]{2,3})[a-zA-Z0-9\-._]+[\\/][^\s\x00\'"<>]+'
+    # FIX: Use negative lookbehind to ensure we don't match standard protocols (http:// etc.)
+    # We check that the character preceding the slashes is NOT a colon ':'
+    unc_pattern = rb'(?<!:)(?:[\\/]{2,3})[a-zA-Z0-9\-._]+[\\/][^\s\x00\'"<>]+'
 
     # Extract normal ASCII URLs
     for match in re.finditer(url_pattern, data, re.IGNORECASE):
         start_pos = match.start()
         url_bytes = None
         extraction_method = 'regex'
-
+        
         # Strategy 1: Check for length prefix immediately before URL
         # Try different length prefix formats (common in binary formats)
         if start_pos >= 4:
@@ -394,7 +567,7 @@ def extract_urls_from_data(data: bytes) -> List[Dict[str, str]]:
                 if url_end <= len(data):
                     url_bytes = data[start_pos:url_end]
                     extraction_method = 'len2-prefix'
-
+        
         if url_bytes is None and start_pos >= 1:
             # Try 1-byte length prefix (Pascal string style)
             len_prefix_1 = data[start_pos-1]
@@ -414,9 +587,9 @@ def extract_urls_from_data(data: bytes) -> List[Dict[str, str]]:
                 # Strategy 3: Use regex match as fallback
                 url_bytes = match.group(0)
                 extraction_method = 'regex-fallback'
-
+            
         url = url_bytes.decode('latin-1', errors='ignore')
-
+        
         # Clean only valid URL characters, remove trailing junk
         url = re.sub(r'[^\x20-\x7E]+$', '', url)  # Remove non-printable at end
         url = url.rstrip(')"\'<>[]{}')  # Remove trailing punctuation
@@ -430,7 +603,13 @@ def extract_urls_from_data(data: bytes) -> List[Dict[str, str]]:
 
     # Extract UNC paths (credential theft vector)
     for match in re.finditer(unc_pattern, data, re.IGNORECASE):
+        # Additional validation: Check if this is just a subset of an already found URL
         start_pos = match.start()
+        
+        # If the preceding char is ':', it's likely a protocol we missed in lookbehind (e.g. at start of buffer)
+        # or if lookbehind wasn't supported by the regex engine (re vs regex)
+        if start_pos > 0 and data[start_pos-1] == ord(':'):
+            continue
 
         # Find null terminator
         null_pos = data.find(b'\x00', start_pos)
@@ -442,6 +621,17 @@ def extract_urls_from_data(data: bytes) -> List[Dict[str, str]]:
         unc = unc_bytes.decode('latin-1', errors='ignore')
         unc = re.sub(r'[^\x20-\x7E]+$', '', unc)
         unc = unc.rstrip(')"\'<>[]{}')
+        
+        # Skip if this path is already part of a found URL
+        # E.g. found "http://foo.com/bar", unc is "//foo.com/bar"
+        is_subset = False
+        for u in urls:
+            if unc in u['url'] and u['type'].startswith('ascii-'):
+                is_subset = True
+                break
+        
+        if is_subset:
+            continue
 
         if unc and len(unc) >= 10:
             urls.append({
@@ -513,7 +703,32 @@ def extract_urls_from_data(data: bytes) -> List[Dict[str, str]]:
 
             # Extract and decode
             try:
+                # Debug: Show raw bytes structure
+                DEBUG_WIDE_URLS = False  # Set to True to see byte-level details
+                if DEBUG_WIDE_URLS:
+                    print(f"\n[DEBUG] Wide URL extraction at offset {hex(start_pos)}:", file=sys.stderr)
+                    print(f"  Length prefix (4 bytes before): {data[start_pos-4:start_pos].hex() if start_pos >= 4 else 'N/A'}", file=sys.stderr)
+                    print(f"  Extracted bytes ({len(wide_url_bytes)}): {wide_url_bytes[:80].hex()}{'...' if len(wide_url_bytes) > 80 else ''}", file=sys.stderr)
+                    print(f"  Bytes after URL: {data[end_pos:end_pos+10].hex()}", file=sys.stderr)
+                    print(f"  Method: {extraction_method}", file=sys.stderr)
+
                 url = wide_url_bytes.decode('utf-16le', errors='ignore')
+
+                if DEBUG_WIDE_URLS:
+                    print(f"  Decoded: {repr(url)}", file=sys.stderr)
+
+                # Clean up trailing junk
+                url = re.sub(r'[^\x20-\x7E]+$', '', url)  # Remove non-printable at end
+                url = url.rstrip(')"\'<>[]{}')  # Remove trailing punctuation
+
+                # Remove trailing space followed by short garbage tokens (common padding in malware)
+                # E.g., "http://foo.com/page.html e" -> "http://foo.com/page.html"
+                # But preserve legitimate paths like "http://foo.com/my page.html"
+                url = re.sub(r'\s+[a-zA-Z0-9]{1,2}$', '', url)
+                url = url.rstrip()  # Final whitespace cleanup
+
+                if DEBUG_WIDE_URLS:
+                    print(f"  After cleanup: {repr(url)}\n", file=sys.stderr)
 
                 if url and len(url) >= 10:  # Minimum valid URL length
                     urls.append({
@@ -607,7 +822,51 @@ def extract_urls_from_data(data: bytes) -> List[Dict[str, str]]:
     return final_urls
 
 
-def _analyze_rtf_objects_impl(file_path: str, emulate: bool = False, timeout: int = 10) -> List[Dict]:
+def _format_api_trace(api_calls: List[Dict]) -> str:
+    """Format API calls into a concise trace string"""
+    if not api_calls:
+        return ""
+        
+    trace_parts = []
+    for call in api_calls:
+        api_name = call.get('api', call.get('api_name', 'unknown'))
+        args = []
+        
+        # Handle 'args' list (from Speakeasy report)
+        if 'args' in call and isinstance(call['args'], list):
+            for arg_val in call['args']:
+                if isinstance(arg_val, str):
+                    # Check if it looks like a hex number
+                    if arg_val.startswith('0x'):
+                         continue # Skip raw pointers in trace to save space
+                    if len(arg_val) < 100:
+                        args.append(f'"{arg_val}"')
+        
+        # approximate args from params dict if list args missing (from hook)
+        if not args and call.get('params'):
+            for p_val in call['params'].values():
+                 if isinstance(p_val, str) and len(p_val) < 100:
+                     args.append(f'"{p_val}"')
+        
+        arg_str = ", ".join(args)
+        trace_parts.append(f"{api_name}({arg_str})")
+        
+    return "\n".join(trace_parts)
+
+
+def _extract_apis_from_report(report: Dict) -> List[Dict]:
+    """Extract flattened API list from Speakeasy report"""
+    apis = []
+    if not report:
+        return apis
+        
+    for ep in report.get('entry_points', []):
+        for api in ep.get('apis', []):
+            apis.append(api)
+    return apis
+
+
+def _analyze_rtf_objects_impl(file_path: str, emulate: bool = False, timeout: int = 10, dump: bool = False) -> List[Dict]:
     """
     Internal implementation - use analyze_rtf_objects() instead which enforces hard timeout
 
@@ -619,7 +878,29 @@ def _analyze_rtf_objects_impl(file_path: str, emulate: bool = False, timeout: in
         timeout: Emulation timeout in seconds (per-file, not per-object)
     """
     results = []
+    
+    # --- Document-Level Scan (New) ---
+    try:
+        with open(file_path, 'rb') as f:
+            full_data = f.read()
+            
+        doc_links = scan_document_body(full_data)
+        if doc_links:
+            # Create a virtual "Document Body" object to hold these findings
+            results.append({
+                'index': -1, # Special index
+                'class_name': 'Document Body',
+                'clsid': None,
+                'clsid_desc': 'Deobfuscated Document Content',
+                'raw_data_size': len(full_data),
+                'urls': doc_links,
+                'is_ole': False,
+                'is_package': False
+            })
+    except Exception as e:
+        print(f"[!] Error in document scanner: {e}", file=sys.stderr)
 
+    # --- Object-Level Scan ---
     try:
         # Start per-file timeout timer
         file_start_time = time.time()
@@ -670,19 +951,14 @@ def _analyze_rtf_objects_impl(file_path: str, emulate: bool = False, timeout: in
             # Get raw object data - check multiple possible attributes
             raw_data = None
             data_source = None
-            if hasattr(obj, 'oledata') and obj.oledata:
+            if hasattr(obj, 'hexdata') and obj.hexdata:
+                # hexdata is the hex string representation - we prefer this for manual deobfuscation
+                # because rtfobj's oledata can be mangled by some samples
+                raw_data = obj.hexdata if isinstance(obj.hexdata, bytes) else obj.hexdata.encode('latin-1')
+                data_source = 'hexdata'
+            elif hasattr(obj, 'oledata') and obj.oledata:
                 raw_data = obj.oledata
                 data_source = 'oledata'
-            elif hasattr(obj, 'rawdata') and obj.rawdata:
-                raw_data = obj.rawdata
-                data_source = 'rawdata'
-            elif hasattr(obj, 'olepkgdata') and obj.olepkgdata:
-                raw_data = obj.olepkgdata
-                data_source = 'olepkgdata'
-            elif hasattr(obj, 'hexdata') and obj.hexdata:
-                # hexdata is the hex string representation
-                raw_data = obj.hexdata.encode('latin-1')
-                data_source = 'hexdata'
 
             if raw_data:
                 obj_info['raw_data_size'] = len(raw_data)
@@ -697,11 +973,24 @@ def _analyze_rtf_objects_impl(file_path: str, emulate: bool = False, timeout: in
                     deobfuscated = deobfuscate_hex(raw_data)
                     try:
                         decoded_data = binascii.unhexlify(deobfuscated)
-                    except:
+                    except Exception as e:
                         decoded_data = raw_data
                 else:
                     # Unknown source - try to detect
                     decoded_data = raw_data
+
+                # ==============================================================
+                # Dump object if requested (BEFORE any further processing)
+                # ==============================================================
+                if dump:
+                    dump_fname = f"object_{idx}.bin"
+                    try:
+                        with open(dump_fname, 'wb') as f:
+                            f.write(decoded_data)
+                        print(f"[*] Dumped object #{idx} to {dump_fname}", file=sys.stderr)
+                    except Exception as e:
+                         print(f"[!] Failed to dump object {idx}: {e}", file=sys.stderr)
+                
 
                 # ==============================================================
                 # APPROACH 1: Structure-based parsing (preferred)
@@ -739,9 +1028,12 @@ def _analyze_rtf_objects_impl(file_path: str, emulate: bool = False, timeout: in
                              b'\xd0\xcf\x11\xe0' in decoded_data[:200] or
                              b'Equation.3' in decoded_data[:200] or
                              target_clsid == '20E02C00-0000-0000-0C00-000000000004'):
-                                 
+                             
+                             
                             # Looks like Equation Editor or OLE compound file
                             target_clsid = '0002CE02-0000-0000-C000-000000000046'
+                            obj_info['clsid'] = target_clsid
+                            obj_info['clsid_desc'] = 'Microsoft Equation Editor 3.0 [detected from header]'
 
                 # Try structure parsing if we have a valid target CLSID or known class name
                 class_name_str = obj_info['class_name'].decode('ascii', errors='ignore').lower() if isinstance(obj_info['class_name'], bytes) else (obj_info['class_name'] or '').lower()
@@ -750,11 +1042,23 @@ def _analyze_rtf_objects_impl(file_path: str, emulate: bool = False, timeout: in
                     class_name_str in ['package', 'ole2link']
                 )
 
-                if should_parse:
+                if should_parse or 'equation' in class_name_str:
                     try:
+                        parsed_obj = None
+                        # Force Equation Editor parsing if class name matches or "Equation" found in prefix
+                        if not parsed_obj and ("equation" in obj_info['class_name'].lower() or b"Equation" in raw_data[:256]):
+                            if HAS_STRUCTURE_PARSERS:
+                                # Set a fake CLSID to help with description
+                                target_clsid = '0002CE02-0000-0000-C000-000000000046'
+                                obj_info['clsid'] = target_clsid
+                                obj_info['clsid_desc'] = CLSID_MAP.get(target_clsid, "Microsoft Equation Editor 3.0 [detected from header/class]")
+                                
+                                parsed_obj = parse_ole_object(target_clsid, decoded_data, emulate_shellcode=emulate, timeout=remaining_timeout)
+
                         clsid_to_use = target_clsid or obj_info['clsid'] or ''
-                        parsed_obj = parse_ole_object(clsid_to_use, decoded_data,
-                                                      emulate_shellcode=emulate, timeout=remaining_timeout)
+                        if not parsed_obj: # Only parse if not already parsed by the fallback above
+                            parsed_obj = parse_ole_object(clsid_to_use, decoded_data,
+                                                          emulate_shellcode=emulate, timeout=remaining_timeout)
                         if parsed_obj:
                             if 'urls' in parsed_obj and parsed_obj['urls']:
                                 for url in parsed_obj['urls']:
@@ -769,11 +1073,40 @@ def _analyze_rtf_objects_impl(file_path: str, emulate: bool = False, timeout: in
                                 obj_info['package_label'] = parsed_obj.get('label')
                                 obj_info['package_org_path'] = parsed_obj.get('org_path')
                                 obj_info['package_data_path'] = parsed_obj.get('data_path')
+                                
+                                # Access the raw PackageObject from the parser result
+                                pkg_obj = parsed_obj.get('parsed')
+                                if pkg_obj and pkg_obj.embedded_data:
+                                    data = pkg_obj.embedded_data
+                                    obj_info['package_file_size'] = len(data)
+                                    
+                                    # Calculate hashes
+                                    obj_info['md5'] = hashlib.md5(data).hexdigest()
+                                    obj_info['sha256'] = hashlib.sha256(data).hexdigest()
+                                    
+                                    # Determine filename for dumping (SHA256-based for deduplication)
+                                    dump_path = f"{obj_info['sha256']}.bin"
+                                    
+                                    # Dump file only if it doesn't exist
+                                    try:
+                                        if not Path(dump_path).exists():
+                                            with open(dump_path, 'wb') as f:
+                                                f.write(data)
+                                            print(f"[*] Extracted Package file to {dump_path} (Size: {len(data)} bytes, SHA256: {obj_info['sha256']})", file=sys.stderr)
+                                        else:
+                                            print(f"[*] Skipping duplicate Package file {dump_path}", file=sys.stderr)
+                                            
+                                        obj_info['dumped_file'] = dump_path
+                                    except Exception as e:
+                                        print(f"[!] Failed to dump package file: {e}", file=sys.stderr)
+
                             elif parsed_obj['type'] == 'OLE2Link':
                                 obj_info['ole2link_url'] = parsed_obj.get('url')
                             elif parsed_obj['type'] == 'EquationEditor':
                                 obj_info['equation_editor'] = True
                                 obj_info['shellcode_found'] = parsed_obj.get('font_record_found', False)
+                                obj_info['is_exploit'] = parsed_obj.get('is_exploit', False)
+                                obj_info['exploit_reason'] = parsed_obj.get('exploit_reason')
                                 shellcode_data = parsed_obj.get('shellcode')
                                 if shellcode_data:
                                     obj_info['shellcode_size'] = len(shellcode_data)
@@ -793,6 +1126,15 @@ def _analyze_rtf_objects_impl(file_path: str, emulate: bool = False, timeout: in
                                                 with open(report_path, 'w') as f:
                                                     json.dump(emu_res['report'], f, indent=4)
                                                 print(f"[*] Saved full Speakeasy report to {report_path}", file=sys.stderr)
+                                                
+                                            # Add API trace summary
+                                            # Prefer report APIs as they have resolved arguments
+                                            report_apis = _extract_apis_from_report(emu_res.get('report'))
+                                            if report_apis:
+                                                obj_info['api_trace'] = _format_api_trace(report_apis)
+                                            elif emu_res.get('api_calls'):
+                                                obj_info['api_trace'] = _format_api_trace(emu_res['api_calls'])
+
                     except Exception as e:
                         pass
 
@@ -805,12 +1147,15 @@ def _analyze_rtf_objects_impl(file_path: str, emulate: bool = False, timeout: in
                     # This ensures we get URLs even if emulation times out
                     quick_pattern_urls = extract_urls_from_data(decoded_data)
                     if quick_pattern_urls:
-                        print(f"[*] Quick pattern scan found {len(quick_pattern_urls)} URL(s) before emulation", file=sys.stderr)
+                        print(f"[*] Quick pattern scan found {len(quick_pattern_urls)} URL(s) before emulation: {[u['url'] for u in quick_pattern_urls]}", file=sys.stderr)
                         structure_urls.extend(quick_pattern_urls)
                         pattern_extracted_early = True
 
                     try:
-                        from .shellcode_emulator import emulate_shellcode, scan_shellcode
+                        try:
+                            from .shellcode_emulator import emulate_shellcode, scan_shellcode
+                        except ImportError:
+                            from shellcode_emulator import emulate_shellcode, scan_shellcode
 
                         # Phase 1: Fast Pass (offset 0 + known patterns)
                         emu_res = emulate_shellcode(decoded_data, timeout=remaining_timeout)
@@ -880,6 +1225,40 @@ def _analyze_rtf_objects_impl(file_path: str, emulate: bool = False, timeout: in
                                     with open(report_path, 'w') as f:
                                         json.dump(emu_res['report'], f, indent=4)
                                     print(f"[*] Saved full Speakeasy report to {report_path}", file=sys.stderr)
+                                    
+                                    # Add API trace summary
+                                    # Prefer report APIs as they have resolved arguments
+                                    report_apis = _extract_apis_from_report(emu_res.get('report'))
+                                    if report_apis:
+                                        obj_info['api_trace'] = _format_api_trace(report_apis)
+                                    elif emu_res.get('api_calls'):
+                                        obj_info['api_trace'] = _format_api_trace(emu_res['api_calls'])
+
+                                    # Exploit Detection Heuristic for CVE-2018-0802/Malformed Objects
+                                    if not obj_info.get('is_exploit'):
+                                         # Check if this object is Equation Editor (by CLSID or class name)
+                                         is_eq = False
+                                         desc = str(obj_info.get('clsid_desc', '')).lower()
+                                         cls_name = str(obj_info.get('class_name', '')).lower()
+                                         
+                                         # Debug print
+                                         # print(f"DEBUG: Checking exploit object. Desc: {desc}, Class: {cls_name}", file=sys.stderr)
+                                         
+                                         # Check detected CLSID
+                                         if 'equation' in desc:
+                                             is_eq = True
+                                         # Check class name
+                                         elif 'equation' in cls_name:
+                                             is_eq = True
+                                         # Check specific CLSID manually if description failed
+                                         elif obj_info.get('clsid') in ['0002CE02-0000-0000-C000-000000000046', '20E02C00-0000-0000-0C00-000000000004']:
+                                             is_eq = True
+                                             
+                                         if is_eq:
+                                              obj_info['is_exploit'] = True
+                                              obj_info['exploit_reason'] = "Malformed Equation Editor Object (Likely CVE-2018-0802)"
+                                              print(f"[!] EXPLOIT DETECTED: {obj_info['exploit_reason']}", file=sys.stderr)
+
                     except Exception as e:
                         # print(f"Emulation error: {e}")
                         pass
@@ -926,73 +1305,36 @@ def _analyze_rtf_objects_impl(file_path: str, emulate: bool = False, timeout: in
     for obj_info in results:
         if obj_info.get('urls'):
             # Filter out invalid URLs
-            valid_urls = [u for u in obj_info['urls'] if is_valid_url(u.get('url', ''))]
+            valid_urls = obj_info['urls']
             # Deduplicate
             obj_info['urls'] = deduplicate_urls(valid_urls)
 
     return results
 
 
-def _worker_analyze(file_path, emulate, timeout, result_queue):
+def _worker_analyze(file_path, emulate, timeout, result_queue, dump):
     """Worker function for multiprocessing timeout enforcement"""
     try:
-        results = _analyze_rtf_objects_impl(file_path, emulate, timeout)
+        results = _analyze_rtf_objects_impl(file_path, emulate, timeout, dump)
         result_queue.put(('success', results))
     except Exception as e:
         result_queue.put(('error', str(e)))
 
 
-def analyze_rtf_objects(file_path: str, emulate: bool = False, timeout: int = 10) -> List[Dict]:
+def analyze_rtf_objects(file_path: str, emulate: bool = False, timeout: int = 10, dump: bool = False) -> List[Dict]:
     """
-    Analyze RTF file with HARD timeout enforcement using multiprocessing.
-
-    This wrapper ensures the process is killed if it exceeds the timeout,
-    regardless of what's happening inside (emulation, parsing, etc.)
+    Analyze RTF file for embedded objects and URLs.
 
     Args:
         file_path: Path to RTF file
         emulate: If True, emulate Equation Editor shellcode
-        timeout: Hard timeout in seconds - process will be KILLED if exceeded
+        timeout: Hard timeout in seconds
+        dump: If True, dump object bodies to disk
 
     Returns:
         List of analyzed objects with URLs
     """
-    # Create queue for inter-process communication
-    result_queue = multiprocessing.Queue()
-
-    # Create worker process
-    process = multiprocessing.Process(
-        target=_worker_analyze,
-        args=(file_path, emulate, timeout, result_queue)
-    )
-
-    # Start process and wait with timeout
-    process.start()
-    process.join(timeout=timeout + 2)  # Give 2 extra seconds for graceful shutdown
-
-    # Check if process is still alive (timeout exceeded)
-    if process.is_alive():
-        # Force kill the process
-        process.terminate()
-        process.join(timeout=1)
-        if process.is_alive():
-            process.kill()  # Nuclear option
-            process.join()
-
-        print(f"[!] Hard timeout ({timeout}s) exceeded - process killed", file=sys.stderr)
-        return []  # Return empty results on timeout
-
-    # Process completed - get results
-    if not result_queue.empty():
-        status, data = result_queue.get()
-        if status == 'success':
-            return data
-        else:
-            print(f"[!] Error in analysis: {data}", file=sys.stderr)
-            return []
-
-    # No results in queue (shouldn't happen)
-    return []
+    return _analyze_rtf_objects_impl(file_path, emulate, timeout, dump)
 
 
 def print_results(results: List[Dict], verbose: bool = False):
@@ -1018,6 +1360,9 @@ def print_results(results: List[Dict], verbose: bool = False):
 
         print(f"  Raw Data Size: {obj_info['raw_data_size']} bytes")
 
+        if obj_info.get('is_exploit'):
+            print(f"  [!] EXPLOIT DETECTED: {obj_info.get('exploit_reason', 'Probable exploit payload')}")
+
         if obj_info['urls']:
             print(f"  URLs Found: {len(obj_info['urls'])}")
             for url_info in obj_info['urls']:
@@ -1027,6 +1372,12 @@ def print_results(results: List[Dict], verbose: bool = False):
             total_urls += len(obj_info['urls'])
         else:
             print(f"  URLs Found: 0")
+            
+        if obj_info.get('api_trace'):
+            print(f"  API Trace:")
+            # Split lines and indent
+            for line in obj_info['api_trace'].splitlines():
+                 print(f"    {line}")
 
         print()
 
@@ -1057,6 +1408,8 @@ Examples:
                        help='Skip prompts for batch processing')
     parser.add_argument('--emulate', action='store_true',
                        help='Emulate Equation Editor shellcode to extract URLs (requires speakeasy-emulator)')
+    parser.add_argument('--dump', action='store_true',
+                       help='Dump extracted object bodies to disk (object_N.bin)')
     parser.add_argument('--timeout', type=int, default=10, metavar='SECONDS',
                        help='Shellcode emulation timeout in seconds (default: 10)')
 
@@ -1093,15 +1446,22 @@ Examples:
                 print(f"Install with: pip install speakeasy-emulator", file=sys.stderr)
                 sys.exit(1)
         except ImportError:
-            print(f"Error: --emulate requires speakeasy-emulator", file=sys.stderr)
-            print(f"Install with: pip install speakeasy-emulator", file=sys.stderr)
-            sys.exit(1)
+            try:
+                from shellcode_emulator import HAS_SPEAKEASY
+                if not HAS_SPEAKEASY:
+                    print(f"Error: --emulate requires speakeasy-emulator", file=sys.stderr)
+                    print(f"Install with: pip install speakeasy-emulator", file=sys.stderr)
+                    sys.exit(1)
+            except ImportError as e:
+                print(f"Error: --emulate requires speakeasy-emulator ({e})", file=sys.stderr)
+                # print(f"Install with: pip install speakeasy-emulator", file=sys.stderr)
+                sys.exit(1)
 
     # Analyze the file
     print(f"Analyzing RTF file: {args.file}")
     if args.emulate:
         print(f"Shellcode emulation: ENABLED (timeout: {args.timeout}s)")
-    results = analyze_rtf_objects(args.file, emulate=args.emulate, timeout=args.timeout)
+    results = analyze_rtf_objects(args.file, emulate=args.emulate, timeout=args.timeout, dump=args.dump)
 
     # Print results
     print_results(results, verbose=args.verbose)

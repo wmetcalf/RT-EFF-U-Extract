@@ -10,13 +10,13 @@ with open("requirements.txt", "r", encoding="utf-8") as fh:
     requirements = [line.strip() for line in fh if line.strip() and not line.startswith("#")]
 
 setup(
-    name="rtf-eff-u-extract",
+    name="rt-eff-u-extract",
     version="0.1.0",
     author="coz",
     description="Extract URLs from RTF embedded objects with deobfuscation and exploit detection",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/yourusername/rtf-eff-u-extract",
+    url="https://github.com/yourusername/rt-eff-u-extract",
     packages=find_packages(),
     classifiers=[
         "Development Status :: 4 - Beta",
@@ -35,12 +35,12 @@ setup(
     install_requires=requirements,
     entry_points={
         "console_scripts": [
-            "rtf-eff-u-extract=rtf_eff_u_extract.cli:main",
+            "rt-eff-u-extract=rt_eff_u_extract.cli:main",
         ],
     },
     include_package_data=True,
     package_data={
-        "rtf_eff_u_extract": ["*.json"],
+        "rt_eff_u_extract": ["*.json"],
     },
     zip_safe=False,
 )

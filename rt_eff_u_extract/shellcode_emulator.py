@@ -255,7 +255,6 @@ class ShellcodeEmulator:
                         def code_hook(emu, addr, size, c):
                             ctx['insn_count'] += 1
                             if ctx['insn_count'] > 50000000: # 50M instruction limit
-                                 # print(f"DEBUG: Instruction limit reached at address 0x{addr:x}")
                                  emu.stop()
                             
                             # Check time every 1000 instructions to avoid syscall overhead
@@ -689,10 +688,6 @@ def _worker_scan_offset(args):
                 'error': res.get('error', '')
             }
             
-        # DEBUG: Print error for specific offset if totally failed
-        if offset == 12288: # 0x3000
-             print(f"[DEBUG] Offset 0x3000 failed: {res.get('error')}", file=sys.stderr)
-            
     except Exception as e:
         # Print actual exception to help debugging
         # print(f"Worker Error: {e}", file=sys.stderr)
@@ -728,7 +723,6 @@ def scan_shellcode(shellcode: bytes, arch='x86', stride=1, timeout=10, limit=0, 
         size = min(size, limit)
 
     # Use heuristics to find likely shellcode entry points
-    print(f"[DEBUG] Using heuristics to find shellcode candidates...", file=sys.stderr)
     heuristic_offsets = find_shellcode_candidates(shellcode, max_candidates=50)
     
     # Merge external priority offsets if provided
@@ -748,17 +742,14 @@ def scan_shellcode(shellcode: bytes, arch='x86', stride=1, timeout=10, limit=0, 
     else:
         priority_offsets = heuristic_offsets
 
-    print(f"[DEBUG] Final priority list: {[hex(x) for x in priority_offsets[:10]]}", file=sys.stderr)
 
     # Try heuristic-found offsets first (Sequential is fine for < 50 items)
     for offset in priority_offsets:
         res = _worker_scan_offset((shellcode, offset, arch, min(10, timeout)))
         if res and res.get('success'):
-            print(f"[DEBUG] Found IOCs at priority offset 0x{offset:x} ({offset})", file=sys.stderr)
             return res
 
     # Exhaustive Fallback: Parallelized
-    print(f"[DEBUG] Heuristics failed. Falling back to exhaustive sliding window scan (stride={stride}, parallel)...", file=sys.stderr)
     
     tasks = []
     checked_offsets = set(priority_offsets)
@@ -800,7 +791,6 @@ def scan_shellcode(shellcode: bytes, arch='x86', stride=1, timeout=10, limit=0, 
                 elif result.get('note') == 'partial':
                     # Partial means we saw API calls but no URL or success flag
                     partial_results.append(result)
-                    print(f"[DEBUG] Partial match at 0x{result['scan_offset']:x}: {len(result['api_calls'])} APIs", file=sys.stderr)
                     
     except KeyboardInterrupt:
         pool.terminate()
@@ -809,18 +799,15 @@ def scan_shellcode(shellcode: bytes, arch='x86', stride=1, timeout=10, limit=0, 
         
     pool.close()
     pool.join()
-    print(f"[DEBUG] Parallel scan finished. Processed {results_count} tasks.", file=sys.stderr)
     
     # Priority 1: Timeouts (loops often indicate shellcode start)
     if timeout_offsets:
          best_off = min(timeout_offsets)
-         print(f"[DEBUG] Scan found {len(timeout_offsets)} timeout(s). Attempting deep emulation on best candidate 0x{best_off:x}...", file=sys.stderr)
          try:
             sliced_data = shellcode[best_off:]
             res = emulate_with_process_timeout(sliced_data, arch=arch, timeout=60)
             if res['success'] and (res['urls'] or len(res['api_calls']) > 0):
                 res['scan_offset'] = best_off
-                print(f"[DEBUG] Deep emulation SUCCESS at 0x{best_off:x}!", file=sys.stderr)
                 return res
          except Exception:
              pass
@@ -830,7 +817,6 @@ def scan_shellcode(shellcode: bytes, arch='x86', stride=1, timeout=10, limit=0, 
         # Sort by number of API calls
         partial_results.sort(key=lambda x: len(x['api_calls']), reverse=True)
         best_partial = partial_results[0]
-        print(f"[DEBUG] No full success, but found {len(partial_results)} partial executions. Returning best at 0x{best_partial['scan_offset']:x}", file=sys.stderr)
         
         # We return this as a success so the tool reports it
         best_partial['success'] = True
