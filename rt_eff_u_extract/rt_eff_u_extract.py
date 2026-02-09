@@ -447,6 +447,43 @@ def scan_document_body(data: bytes) -> List[Dict]:
     return results
 
 
+def strip_bin_runs(data: bytes) -> Tuple[bytes, int]:
+    r"""
+    Strip \binN runs from raw RTF data before parser sees it.
+
+    The \bin control word declares N bytes of raw binary data embedded in the
+    RTF stream. Malware uses this to inject junk padding into \objdata hex
+    regions, inflating objects and evading signature detection (Mandiant blog
+    Section 2e).
+
+    rtfobj handles \bin by converting the binary bytes to hex and concatenating
+    them into the hex stream. This breaks nibble alignment when \bin appears at
+    an odd nibble boundary. Stripping the runs before parsing avoids this.
+
+    Returns:
+        (cleaned_data, count_of_bin_runs_stripped)
+    """
+    # \bin followed by required numeric parameter, optional single space delimiter
+    # Must NOT match \binary or other \bin* control words
+    pattern = re.compile(rb'\\bin(\d+) ?')
+    result = bytearray()
+    pos = 0
+    count = 0
+    while pos < len(data):
+        m = pattern.search(data, pos)
+        if not m:
+            result.extend(data[pos:])
+            break
+        # Copy everything before the \bin match
+        result.extend(data[pos:m.start()])
+        n = int(m.group(1))
+        # Skip the \binN control word + N binary bytes
+        skip_to = m.end() + n
+        pos = min(skip_to, len(data))
+        count += 1
+    return bytes(result), count
+
+
 def deobfuscate_hex(hex_data: bytes) -> bytes:
     r"""
     Remove common obfuscations from hex-encoded data based on RTF parser behavior.
@@ -908,6 +945,12 @@ def _analyze_rtf_objects_impl(file_path: str, emulate: bool = False, timeout: in
         # Read RTF file as bytes
         with open(file_path, 'rb') as f:
             rtf_data = f.read()
+
+        # Pre-process: strip \bin runs before rtfobj parses
+        # rtfobj merges \bin bytes into hex, breaking nibble alignment
+        rtf_data, bin_count = strip_bin_runs(rtf_data)
+        if bin_count:
+            print(f"[*] Stripped {bin_count} \\bin run(s) from RTF data", file=sys.stderr)
 
         # Parse RTF file
         rtf_parser = rtfobj.RtfObjParser(rtf_data)
