@@ -484,73 +484,346 @@ def strip_bin_runs(data: bytes) -> Tuple[bytes, int]:
     return bytes(result), count
 
 
-def deobfuscate_hex(hex_data: bytes) -> bytes:
+def _count_and_sub(pattern, repl, string, flags=0):
+    """Count regex matches, then substitute. Returns (new_string, count)."""
+    count = len(re.findall(pattern, string, flags=flags))
+    return re.sub(pattern, repl, string, flags=flags), count
+
+
+_HEX_CHARS = set(b'0123456789abcdefABCDEF')
+
+# Import rtfobj's known destination control words for accurate {\*\dest} handling.
+# Known destinations (like \comment) cause rtfobj to open a new destination context,
+# diverting text away from the objdata stream. Unknown CWs after \* do NOT divert —
+# hex chars after them stay in the objdata stream. We must match this behavior.
+try:
+    from oletools.rtfobj import DESTINATION_CONTROL_WORDS as _RTFOBJ_DEST_CWS
+    _DEST_CW_STRS = frozenset(cw.decode('ascii', errors='ignore') for cw in _RTFOBJ_DEST_CWS)
+except Exception:
+    _DEST_CW_STRS = frozenset()
+
+
+def deobfuscate_hex(hex_data: bytes, track: bool = False):
     r"""
-    Remove common obfuscations from hex-encoded data based on RTF parser behavior.
+    Remove obfuscation from hex-encoded RTF \objdata using a proper state-machine
+    parser instead of regexes.
 
-    Handles techniques from: https://cloud.google.com/blog/topics/threat-intelligence/how-rtf-malware-evades-detection
-    - Whitespace (spaces, tabs, newlines, carriage returns)
-    - RTF comments (\* ... )
-    - \' escape sequences that disorder hex state
-    - Escaped special characters (\\, \{, \}, \+, \-, \%)
-    - Unicode control words (\ucN, \uN)
-    - Control words split across hex data
-    - Oversized control words (up to 0xFF / 255 chars)
-    - Oversized numeric parameters (\bin with overflow)
-    - Multiple \objdata entries (use last)
-    - Control words ignored in objdata context (\par, etc.)
+    Walks the data character by character, implementing the RTF hex parser behavior:
+    - Hex chars [0-9a-fA-F] are accumulated
+    - '\' starts a control word: reads name (letters), optional numeric param
+      (digits with optional '-' sign), optional space delimiter — all discarded
+    - '\binN' skips N following bytes (binary data)
+    - '\'hh' escape sequences are discarded and reset nibble state (matches rtfobj/Word)
+    - '\\' '\{' '\}' and other escaped specials are discarded
+    - '{' pushes group depth; '}' pops it
+    - '{\*\knownDest ...}' — known destination, all content discarded (matches rtfobj)
+    - '{\*\unknownCW ...}' — CW skipped, hex chars kept (matches rtfobj)
+    - Whitespace and all other non-hex chars are ignored
+
+    Args:
+        hex_data: Raw hex data from \objdata region (bytes or str)
+        track: If True, return (cleaned_bytes, stats_dict)
+
+    Returns:
+        bytes of clean hex chars, or (bytes, dict) if track=True
     """
+    stats = {}
     if not hex_data:
-        return hex_data
+        return (hex_data, stats) if track else hex_data
 
-    # Convert to string if bytes
     if isinstance(hex_data, bytes):
-        try:
-            hex_str = hex_data.decode('latin-1')
-        except:
-            return hex_data
+        data = hex_data
     else:
-        hex_str = hex_data
+        data = hex_data.encode('latin-1')
 
-    # Remove RTF escaped special characters (ignored in objdata context)
-    # These are literal characters that need escaping: \\ \{ \} \+ \- \%
-    hex_str = re.sub(r'\\[\\{}+\-%]', '', hex_str)
+    result = bytearray()
+    i = 0
+    length = len(data)
 
-    # Remove \\' escape sequences (\'HH format) - these disorder the hex state machine
-    # Example: 01\'1122 -> the \'11 resets state and causes the 0 of 01 to be dropped
-    hex_str = re.sub(r"\\'[0-9a-fA-F]{2}", '', hex_str)
+    # Stack tracking whether hex chars should be kept at each brace depth.
+    # Known destinations after \* push False (discard hex); everything else
+    # inherits from parent. Top-level always keeps.
+    keep_stack = [True]
+    # Track whether any hex chars have been emitted in the current group.
+    # Used to decide \* handling: {\*\unknownCW} discards when no hex
+    # preceded \* (RTF ignorable destination), but {hex\*\unknownCW}
+    # keeps hex that appeared before \*.
+    group_hex_count = [0]
 
-    # Remove Unicode control words: \ucN and \uN (both ignored, chars after \uN not skipped)
-    hex_str = re.sub(r'\\uc\d+\s*', '', hex_str)
-    hex_str = re.sub(r'\\u-?\d+\s*', '', hex_str)
+    while i < length:
+        ch = data[i]
 
-    # Remove RTF comments/ignorable groups: {\* ... }
-    # This must run BEFORE specific ignorable destination removal to catch the full group
-    hex_str = re.sub(r'\{\\[*][^{}]+\}', '', hex_str)
+        if ch == 0x5C:  # '\'
+            # Backslash — start of control word or escaped char
+            if i + 1 >= length:
+                i += 1
+                continue
 
-    # Remove RTF ignorable destinations: \\*\\destination
-    # Example: {\*\generator Word}
-    hex_str = re.sub(r'\\[*]\\[a-z0-9]+\s*', '', hex_str)
+            next_ch = data[i + 1]
 
-    # Remove common control words that are ignored in objdata context
-    # \par, \pard, etc. - these don't accept data
-    hex_str = re.sub(r'\\(?:par|pard|tab|line|page)[^a-z0-9]', '', hex_str)
+            # Escaped specials: \\ \{ \} \+ \- \%
+            if next_ch in (0x5C, 0x7B, 0x7D, 0x2B, 0x2D, 0x25):
+                stats['escaped_specials'] = stats.get('escaped_specials', 0) + 1
+                i += 2
+                continue
 
-    # Remove whitespace (including \r and \n which RTF parser ignores)
-    hex_str = re.sub(r'[\s\r\n]+', '', hex_str)
+            # \' escape: \'HH — nibble-state management (matches rtfobj/MS Word)
+            # MS Word resets nibble accumulator: if odd count of hex chars
+            # accumulated so far, drop the last one (orphaned high nibble)
+            if next_ch == 0x27:  # "'"
+                stats['escape_sequences'] = stats.get('escape_sequences', 0) + 1
+                if len(result) & 1:
+                    result.pop()
+                i += min(4, length - i)  # skip \' + 2 hex chars (clamp to end)
+                continue
 
-    # Handle split control words - remove legitimate RTF control sequences
-    # Match: \controlword123 or \controlword-123 (with optional numeric parameter)
-    # Note: Spec says max 32 chars, but MS Word allows up to 0xFF (255) - oversized control word attack
-    hex_str = re.sub(r'\\[a-z]{1,255}[-]?\d*\s*', '', hex_str, flags=re.IGNORECASE)
+            # \* ignorable destination marker
+            if next_ch == 0x2A:  # '*'
+                # RTF spec: \* marks the group as an ignorable destination.
+                # If the following CW is a known destination, always discard.
+                # If unknown AND no hex chars were emitted in this group
+                # before \*, discard too (the whole group is ignorable).
+                # If unknown but hex chars preceded \*, keep the group
+                # (the hex is real data; only the \*\CW part is ignorable).
+                j = i + 2
+                while j < length and data[j] in (0x20, 0x09, 0x0D, 0x0A):
+                    j += 1
+                dest_name = None
+                if j < length and data[j] == 0x5C:  # backslash starting CW
+                    k = j + 1
+                    while k < length and ((0x61 <= data[k] <= 0x7A) or (0x41 <= data[k] <= 0x5A)):
+                        k += 1
+                    if k > j + 1:
+                        dest_name = data[j+1:k].decode('latin-1').lower()
+                if len(keep_stack) > 1 and dest_name:
+                    if dest_name in _DEST_CW_STRS:
+                        # Known destination — always discard
+                        keep_stack[-1] = False
+                    elif group_hex_count[-1] == 0:
+                        # Unknown dest but no hex preceded \* in this group
+                        # — treat the entire group as ignorable
+                        keep_stack[-1] = False
+                stats['comments'] = stats.get('comments', 0) + 1
+                i += 2
+                continue
 
-    # Remove braces and remaining backslashes that aren't part of hex
-    hex_str = hex_str.replace('{', '').replace('}', '').replace('\\', '')
+            # Control word: \<letters>[<-?digits>][<space>]
+            if 0x61 <= next_ch <= 0x7A or 0x41 <= next_ch <= 0x5A:  # a-z or A-Z
+                j = i + 1
+                # Read CW name (letters)
+                while j < length and ((0x61 <= data[j] <= 0x7A) or (0x41 <= data[j] <= 0x5A)):
+                    j += 1
+                cw_name = data[i+1:j].decode('latin-1').lower()
 
-    # Remove any remaining non-hex characters
-    hex_str = re.sub(r'[^0-9a-fA-F]', '', hex_str)
+                # Read optional numeric parameter
+                param_start = j
+                if j < length and data[j] == 0x2D:  # '-'
+                    j += 1
+                while j < length and 0x30 <= data[j] <= 0x39:  # 0-9
+                    j += 1
 
-    return hex_str.encode('latin-1')
+                # Optional space delimiter (consumed)
+                if j < length and data[j] == 0x20:  # ' '
+                    j += 1
+
+                # Handle \bin: skip N raw bytes
+                if cw_name == 'bin' and param_start < j:
+                    param_str = data[param_start:j].rstrip(b' ').decode('latin-1')
+                    try:
+                        n_bytes = max(0, int(param_str))
+                    except ValueError:
+                        n_bytes = 0
+                    stats['bin_runs'] = stats.get('bin_runs', 0) + 1
+                    i = min(j + n_bytes, length)
+                    continue
+
+                # Known destination CW inside a group — discard remaining
+                # content (matches rtfobj, which opens a new context for
+                # destinations like \object, \objdata, \comment, etc.)
+                if cw_name in _DEST_CW_STRS and len(keep_stack) > 1:
+                    keep_stack[-1] = False
+
+                stats['generic_control_words'] = stats.get('generic_control_words', 0) + 1
+                i = j
+                continue
+
+            # Control symbol: backslash + single non-alpha char (e.g. \2, \;, \?)
+            # rtfobj skips both bytes as a control symbol. We must match.
+            stats['stray_backslashes'] = stats.get('stray_backslashes', 0) + 1
+            i += 2
+            continue
+
+        elif ch == 0x7B:  # '{'
+            keep_stack.append(keep_stack[-1])  # inherit parent keep state
+            group_hex_count.append(0)
+            stats['brace_groups'] = stats.get('brace_groups', 0) + 1
+            i += 1
+            continue
+
+        elif ch == 0x7D:  # '}'
+            if len(keep_stack) > 1:
+                keep_stack.pop()
+            if len(group_hex_count) > 1:
+                group_hex_count.pop()
+            stats['brace_groups'] = stats.get('brace_groups', 0) + 1
+            i += 1
+            continue
+
+        elif ch in _HEX_CHARS:
+            if keep_stack[-1]:
+                result.append(ch)
+                group_hex_count[-1] += 1
+            i += 1
+            continue
+
+        else:
+            # Whitespace or other non-hex — skip
+            if ch in (0x20, 0x09, 0x0D, 0x0A):
+                stats['whitespace'] = stats.get('whitespace', 0) + 1
+            else:
+                stats['non_hex_chars'] = stats.get('non_hex_chars', 0) + 1
+            i += 1
+            continue
+
+    result_bytes = bytes(result)
+    return (result_bytes, stats) if track else result_bytes
+
+
+def deobfuscate_rtf_file(file_path: str, output_path: str) -> dict:
+    r"""
+    Read an RTF file, safely deobfuscate it, and write a cleaned version.
+
+    Strategy: Use our own deobfuscate_hex() state-machine parser directly
+    on each \objdata region.  This avoids rtfobj's hex-leakage bugs with
+    complex obfuscation (nested groups whose CW names contain hex-like
+    chars a-f) and removes the need for fragile position-matching between
+    rtfobj objects and original file positions.
+
+    Also handles:
+    - Nested \objdata regions (only innermost leaf regions are cleaned)
+    - Object-level keywords embedded in hex regions are relocated before
+      the \objdata keyword so Word still sees them
+
+    Returns dict with stats about what was cleaned.
+    """
+    with open(file_path, 'rb') as f:
+        data = f.read()
+
+    stats = {'objdata_regions': 0, 'header_fixed': False}
+
+    # Object-level keywords to relocate from inside \objdata hex regions
+    _obj_kw_re = re.compile(
+        rb'\\(obj(?:link|emb|html|ocx|autlink|sub|pub|icemb'
+        rb'|w|h|setsize|scalex|scaley|cropb|cropt|cropl|cropr'
+        rb'|update|time|class|name))(-?\d*)',
+        re.IGNORECASE,
+    )
+
+    # Find all \objdata regions in the original data.
+    # Consume optional numeric parameter and trailing space, matching
+    # RTF CW syntax (\name[-]digits[ ]).  Obfuscation may append digits
+    # directly after \objdata (e.g. \objdata87598{...}) — these are the
+    # CW parameter, not hex data.
+    objdata_pat = re.compile(rb'\\objdata-?\d*\s?', re.IGNORECASE)
+    orig_regions = []
+    for m in objdata_pat.finditer(data):
+        kw_start = m.start()
+        region_start = m.end()
+        depth = 0
+        i = region_start
+        while i < len(data):
+            b = data[i:i+1]
+            if b == b'\\' and i + 1 < len(data) and data[i+1:i+2] in (b'{', b'}', b'\\'):
+                i += 2
+                continue
+            if b == b'{':
+                depth += 1
+            elif b == b'}':
+                if depth == 0:
+                    orig_regions.append((kw_start, region_start, i))
+                    break
+                depth -= 1
+            i += 1
+
+    stats['objdata_regions'] = len(orig_regions)
+
+    # Detect nested regions: an inner \objdata inside an outer \objdata.
+    # Only replace innermost (leaf) regions — outer regions would lose
+    # the inner \object when their hex content is replaced.
+    nested_parents = set()
+    for i, (kw_i, hs_i, he_i) in enumerate(orig_regions):
+        for j, (kw_j, hs_j, he_j) in enumerate(orig_regions):
+            if i != j and hs_j >= hs_i and he_j <= he_i:
+                nested_parents.add(i)
+
+    # Build replacements using our own hex parser on each region.
+    replacements = []
+    for idx, (kw_start, hex_start, hex_end) in enumerate(orig_regions):
+        if idx in nested_parents:
+            continue
+
+        raw_region = data[hex_start:hex_end]
+        clean_hex_bytes = deobfuscate_hex(raw_region)
+        clean_hex = clean_hex_bytes.decode('latin-1')
+
+        # Skip regions where all data is in \bin runs (raw binary OLE
+        # data, no hex chars).  Replacing with empty hex would destroy
+        # the object.  Leave the region as-is — Word handles \bin natively.
+        if not clean_hex:
+            continue
+
+        # Extract object-level keywords embedded in the hex region
+        relocated_kws = []
+        seen_kws = set()
+        for km in _obj_kw_re.finditer(raw_region):
+            kw_name = km.group(1).lower()
+            if kw_name not in seen_kws:
+                seen_kws.add(kw_name)
+                relocated_kws.append(km.group(0))
+
+        if len(clean_hex) % 2:
+            clean_hex = clean_hex[:-1]
+
+        # Fix corrupted OLE1 version field.  Obfuscation can scatter
+        # junk hex chars at depth 0 before the real OLE data, corrupting
+        # the 4-byte version field while leaving the rest intact.  If
+        # format_id (bytes 4-7) and ProgID structure validate, replace
+        # the version with the standard 0x00000501.
+        if len(clean_hex) >= 24:
+            try:
+                raw_bytes = bytes.fromhex(clean_hex[:24])
+                fmt_id = int.from_bytes(raw_bytes[4:8], 'little')
+                pid_len = int.from_bytes(raw_bytes[8:12], 'little')
+                ver = int.from_bytes(raw_bytes[0:4], 'little')
+                if (fmt_id in (1, 2, 5)
+                        and 1 <= pid_len <= 255
+                        and ver != 0x501):
+                    # Validate ProgID is printable ASCII
+                    pid_end = 12 + pid_len
+                    if pid_end * 2 <= len(clean_hex):
+                        pid_bytes = bytes.fromhex(
+                            clean_hex[24:pid_end * 2])
+                        if pid_bytes and 0x20 <= pid_bytes[0] <= 0x7E:
+                            clean_hex = '01050000' + clean_hex[8:]
+            except (ValueError, IndexError):
+                pass
+
+        replacements.append((kw_start, hex_end, clean_hex, relocated_kws))
+
+    # Apply replacements backwards to preserve offsets
+    for kw_start, hex_end, clean_hex, relocated_kws in reversed(replacements):
+        lines = [clean_hex[j:j+64] for j in range(0, len(clean_hex), 64)]
+        formatted = '\r\n'.join(lines).encode('latin-1')
+
+        # Build replacement: relocated keywords + \objdata + clean hex
+        kw_prefix = b''.join(relocated_kws) if relocated_kws else b''
+        replacement = kw_prefix + b'\\objdata ' + formatted
+        data = data[:kw_start] + replacement + data[hex_end:]
+
+    with open(output_path, 'wb') as f:
+        f.write(data)
+
+    return stats
 
 
 def extract_urls_from_data(data: bytes) -> List[Dict[str, str]]:
@@ -920,20 +1193,28 @@ def _analyze_rtf_objects_impl(file_path: str, emulate: bool = False, timeout: in
     try:
         with open(file_path, 'rb') as f:
             full_data = f.read()
-            
+
+        # Check for truncated RTF header: {\rt but not {\rtf
+        # Valid RTF starts with {\rtf1, {\rt alone is an evasion technique
+        truncated_header = full_data[:5].startswith(b'{\\rt') and not full_data[:5].startswith(b'{\\rtf')
+
         doc_links = scan_document_body(full_data)
-        if doc_links:
+        if doc_links or truncated_header:
             # Create a virtual "Document Body" object to hold these findings
-            results.append({
+            doc_result = {
                 'index': -1, # Special index
                 'class_name': 'Document Body',
                 'clsid': None,
                 'clsid_desc': 'Deobfuscated Document Content',
                 'raw_data_size': len(full_data),
-                'urls': doc_links,
+                'urls': doc_links or [],
                 'is_ole': False,
                 'is_package': False
-            })
+            }
+            if truncated_header:
+                doc_result['truncated_header'] = True
+                print(f"[!] Truncated RTF header detected: {{\\rt without {{\\rtf - possible evasion", file=sys.stderr)
+            results.append(doc_result)
     except Exception as e:
         print(f"[!] Error in document scanner: {e}", file=sys.stderr)
 
@@ -951,6 +1232,44 @@ def _analyze_rtf_objects_impl(file_path: str, emulate: bool = False, timeout: in
         rtf_data, bin_count = strip_bin_runs(rtf_data)
         if bin_count:
             print(f"[*] Stripped {bin_count} \\bin run(s) from RTF data", file=sys.stderr)
+            # Attach bin_runs stat to the Document Body result if it exists
+            for r in results:
+                if r.get('index') == -1:
+                    r.setdefault('obfuscation', {})['bin_runs'] = bin_count
+                    break
+
+        # Pre-scan raw objdata regions for obfuscation stats BEFORE rtfobj
+        # cleans the hex. rtfobj strips obfuscation internally, so we lose
+        # visibility unless we scan the raw data first.
+        # Also store deobfuscated hex as fallback for when rtfobj's parsing fails.
+        _raw_objdata_pattern = re.compile(rb'\\objdata\s*', re.IGNORECASE)
+        raw_obfuscation_stats = []
+        _deobfuscated_hex_regions = []  # fallback: [(clean_hex_bytes, ...)]
+        for m in _raw_objdata_pattern.finditer(rtf_data):
+            region_start = m.end()
+            depth = 0
+            i = region_start
+            while i < len(rtf_data):
+                b = rtf_data[i:i+1]
+                if b == b'\\' and i + 1 < len(rtf_data) and rtf_data[i+1:i+2] in (b'{', b'}', b'\\'):
+                    i += 2
+                    continue
+                if b == b'{':
+                    depth += 1
+                elif b == b'}':
+                    if depth == 0:
+                        clean_hex, stats = deobfuscate_hex(rtf_data[region_start:i], track=True)
+                        raw_obfuscation_stats.append(stats)
+                        # Convert clean hex to binary for fallback
+                        try:
+                            import binascii
+                            raw_bytes = binascii.unhexlify(clean_hex)
+                            _deobfuscated_hex_regions.append(raw_bytes)
+                        except Exception:
+                            _deobfuscated_hex_regions.append(None)
+                        break
+                    depth -= 1
+                i += 1
 
         # Parse RTF file
         rtf_parser = rtfobj.RtfObjParser(rtf_data)
@@ -1014,6 +1333,10 @@ def _analyze_rtf_objects_impl(file_path: str, emulate: bool = False, timeout: in
                 elif data_source == 'hexdata':
                     # hexdata is a hex string - deobfuscate and unhexlify
                     deobfuscated = deobfuscate_hex(raw_data)
+                    # Use pre-scanned raw stats (rtfobj already cleaned hexdata,
+                    # so scanning it finds nothing)
+                    if idx < len(raw_obfuscation_stats) and raw_obfuscation_stats[idx]:
+                        obj_info['obfuscation'] = raw_obfuscation_stats[idx]
                     try:
                         decoded_data = binascii.unhexlify(deobfuscated)
                     except Exception as e:
@@ -1406,6 +1729,9 @@ def print_results(results: List[Dict], verbose: bool = False):
 
         print(f"  Raw Data Size: {obj_info['raw_data_size']} bytes")
 
+        if obj_info.get('truncated_header'):
+            print(f"  [!] TRUNCATED HEADER: {{\\rt without {{\\rtf - evasion technique")
+
         if obj_info.get('is_exploit'):
             print(f"  [!] POSSIBLE EXPLOIT DETECTED: {obj_info.get('exploit_reason', 'Probable exploit payload')}")
 
@@ -1419,6 +1745,13 @@ def print_results(results: List[Dict], verbose: bool = False):
         else:
             print(f"  URLs Found: 0")
             
+        if obj_info.get('obfuscation'):
+            stats = obj_info['obfuscation']
+            total = sum(stats.values())
+            print(f"  Obfuscation Detected: {total} artifacts")
+            for technique, count in sorted(stats.items(), key=lambda x: -x[1]):
+                print(f"    {technique}: {count}")
+
         if obj_info.get('api_trace'):
             print(f"  API Trace:")
             # Split lines and indent
@@ -1456,6 +1789,8 @@ Examples:
                        help='Emulate Equation Editor shellcode to extract URLs (requires speakeasy-emulator)')
     parser.add_argument('--dump', action='store_true',
                        help='Dump extracted object bodies to disk (object_N.bin)')
+    parser.add_argument('--deobfuscate', metavar='FILE',
+                       help='Write a deobfuscated copy of the RTF to FILE')
     parser.add_argument('--timeout', type=int, default=10, metavar='SECONDS',
                        help='Shellcode emulation timeout in seconds (default: 10)')
 
@@ -1511,6 +1846,17 @@ Examples:
 
     # Print results
     print_results(results, verbose=args.verbose)
+
+    # Write deobfuscated RTF if requested
+    if args.deobfuscate:
+        deobf_stats = deobfuscate_rtf_file(args.file, args.deobfuscate)
+        print(f"Deobfuscated RTF written to: {args.deobfuscate}")
+        if deobf_stats['header_fixed']:
+            print(f"  Fixed truncated RTF header -> {{\\rtf1")
+        if deobf_stats['bin_runs']:
+            print(f"  Stripped {deobf_stats['bin_runs']} \\bin run(s)")
+        if deobf_stats['objdata_regions']:
+            print(f"  Cleaned {deobf_stats['objdata_regions']} \\objdata region(s)")
 
     # Export to JSON if requested
     if args.json:
