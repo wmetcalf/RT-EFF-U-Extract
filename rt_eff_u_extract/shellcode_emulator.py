@@ -694,6 +694,116 @@ def _worker_scan_offset(args):
         pass
     return None
 
+def _threaded_shellcode_scan(shellcode: bytes, offsets, arch, timeout):
+    """Analyze shellcode at multiple offsets using
+    multiprocessing. Handles failed analyses via process timeouts.
+
+    Args:
+      shellcode: Raw bytes to scan
+      offsets: List of byte offsets 
+      arch: Architecture
+      timeout: Timeout per attempt
+
+    Returns: 2 element tuple, 1st element is timeout offsets,
+             (list) , 2nd element is partial analysis results (list).
+
+    """
+
+    # Set up 1 task for each byte offset.
+    tasks = []    
+    for offset in offsets:
+        tasks.append((shellcode, offset, arch, timeout))
+
+    # Use all of the CPU cores for multiprocessing.
+    try:
+        workers = multiprocessing.cpu_count()
+    except:
+        workers = 4
+            
+    # Initializer to ignore SIGINT so main process handles it
+    original_sigint_handler = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    pool = multiprocessing.Pool(workers)
+    signal.signal(signal.SIGINT, original_sigint_handler)
+    
+    best_result = None
+    timeout_offsets = []
+    partial_results = []
+
+    try:
+        # Use imap_unordered to return as soon as we find something
+        results_count = 0
+        results_iterator = pool.imap_unordered(_worker_scan_offset, tasks, chunksize=1)
+        while True:
+            # Timeout each analysis task. This handles analyses that
+            # fail with a seg fault, the task will hang and time out.
+            result = results_iterator.next(timeout + 1)
+            results_count += 1
+            if result:
+                if result.get('success'):
+                    # FOUND IT!
+                    pool.terminate()
+                    return result
+                    
+                if result.get('note') == 'timeout':
+                    timeout_offsets.append(result['scan_offset'])
+                    
+                elif result.get('note') == 'partial':
+                    # Partial means we saw API calls but no URL or success flag
+                    partial_results.append(result)
+                    
+    except KeyboardInterrupt:
+        pool.terminate()
+        pool.join()
+        raise
+
+    except StopIteration:
+        # Finished analysis.
+        pass
+    
+    pool.close()
+    pool.join()
+
+    # Done.
+    return (timeout_offsets, partial_results)
+
+def _process_results(timeout_offsets, partial_results):
+    """Process the raw shellcode analysis results from multiprocess
+    shellcode analysis and figure out if we have good final results to
+    return.
+
+    Args:
+        timeout_offsets: Results from analyses that timed out.
+        partial_results: Results from regular analyses.
+
+    Returns: 
+        None if no good results are found, good results if found.
+
+    """
+    # Priority 1: Timeouts (loops often indicate shellcode start)
+    if timeout_offsets:
+         best_off = min(timeout_offsets)
+         try:
+            sliced_data = shellcode[best_off:]
+            res = emulate_with_process_timeout(sliced_data, arch=arch, timeout=60)
+            if res['success'] and (res['urls'] or len(res['api_calls']) > 0):
+                res['scan_offset'] = best_off
+                return res
+         except Exception:
+             pass
+
+    # Priority 2: Partial matches (executed code but maybe obfuscated URL)
+    if partial_results:
+        # Sort by number of API calls
+        partial_results.sort(key=lambda x: len(x['api_calls']), reverse=True)
+        best_partial = partial_results[0]
+        
+        # We return this as a success so the tool reports it
+        best_partial['success'] = True
+        return best_partial
+
+    # Nothing found.
+    return None
+
 def scan_shellcode(shellcode: bytes, arch='x86', stride=1, timeout=10, limit=0, workers=None, priority_offsets=None) -> Dict:
     """
     Scan for shellcode entry points using a sliding window with priority offsets.
@@ -742,86 +852,32 @@ def scan_shellcode(shellcode: bytes, arch='x86', stride=1, timeout=10, limit=0, 
     else:
         priority_offsets = heuristic_offsets
 
+    # Try heuristic-found offsets first.
+    timeout_offsets, partial_results = _threaded_shellcode_scan(shellcode, priority_offsets, arch, timeout)
 
-    # Try heuristic-found offsets first (Sequential is fine for < 50 items)
-    for offset in priority_offsets:
-        res = _worker_scan_offset((shellcode, offset, arch, min(10, timeout)))
-        if res and res.get('success'):
-            return res
+    # Did we get analysis results from shellcode emulation?
+    final_res = _process_results(timeout_offsets, partial_results)
+    if final_res:
+        return final_res
 
-    # Exhaustive Fallback: Parallelized
-    
+    # Exhaustive Fallback: Parallelized    
     tasks = []
     checked_offsets = set(priority_offsets)
-    
+    exhaustive_offsets = []
     for offset in range(0, size, stride):
         if offset in checked_offsets:
             continue
-        tasks.append((shellcode, offset, arch, timeout))
-        
-    if workers is None:
-        try:
-            workers = multiprocessing.cpu_count()
-        except:
-            workers = 4
-            
-    # Initializer to ignore SIGINT so main process handles it
-    original_sigint_handler = signal.signal(signal.SIGINT, signal.SIG_IGN)
-    pool = multiprocessing.Pool(workers)
-    signal.signal(signal.SIGINT, original_sigint_handler)
-    
-    best_result = None
-    timeout_offsets = []
-    partial_results = []
+        exhaustive_offsets.append(offset)
 
-    try:
-        # Use imap_unordered to return as soon as we find something
-        results_count = 0
-        for result in pool.imap_unordered(_worker_scan_offset, tasks, chunksize=16):
-            results_count += 1
-            if result:
-                if result.get('success'):
-                    # FOUND IT!
-                    pool.terminate()
-                    return result
-                    
-                if result.get('note') == 'timeout':
-                    timeout_offsets.append(result['scan_offset'])
-                    
-                elif result.get('note') == 'partial':
-                    # Partial means we saw API calls but no URL or success flag
-                    partial_results.append(result)
-                    
-    except KeyboardInterrupt:
-        pool.terminate()
-        pool.join()
-        raise
-        
-    pool.close()
-    pool.join()
-    
-    # Priority 1: Timeouts (loops often indicate shellcode start)
-    if timeout_offsets:
-         best_off = min(timeout_offsets)
-         try:
-            sliced_data = shellcode[best_off:]
-            res = emulate_with_process_timeout(sliced_data, arch=arch, timeout=60)
-            if res['success'] and (res['urls'] or len(res['api_calls']) > 0):
-                res['scan_offset'] = best_off
-                return res
-         except Exception:
-             pass
+    # Run analysis at the exhaustive offsets.
+    timeout_offsets, partial_results = _threaded_shellcode_scan(shellcode, exhaustive_offsets, arch, timeout)
 
-    # Priority 2: Partial matches (executed code but maybe obfuscated URL)
-    if partial_results:
-        # Sort by number of API calls
-        partial_results.sort(key=lambda x: len(x['api_calls']), reverse=True)
-        best_partial = partial_results[0]
+    # Did we get analysis results from shellcode emulation?
+    final_res = _process_results(timeout_offsets, partial_results)
+    if final_res:
+        return final_res    
         
-        # We return this as a success so the tool reports it
-        best_partial['success'] = True
-        return best_partial
-
+    # No results found via shellcode emulation.
     return {
         'success': False,
         'error': 'No significant IOCs found (checked heuristics + exhaustive)',
